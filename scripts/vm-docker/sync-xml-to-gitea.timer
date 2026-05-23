@@ -1,0 +1,13 @@
+[Unit]
+Description=Periodic snapshot of /opt/mcp-xml to Gitea (every 30 min)
+Documentation=https://<vm-docker-host>:3000/admin/Orchestrator/src/branch/main/scripts/vm-docker/
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=30min
+AccuracySec=1min
+Persistent=true
+Unit=sync-xml-to-gitea.service
+
+[Install]
+WantedBy=timers.target
