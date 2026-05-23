@@ -1,33 +1,37 @@
 # Orchestrator project registry
 #
-# Each entry MUST have explicit path_local (no auto-discovery).
-# path_local INVARIANT: must point at the root of the 1C XML dump
-# (i.e. directly contains Configuration.xml + Catalogs/, Documents/, etc.)
-# that the project's codemetadata container indexes. spawn-analyst.ps1
-# enforces this via a startup-check before opening the analyst tab.
+# path_local INVARIANT (default): must point at the root of the 1C XML dump
+# (Configuration.xml + Catalogs/). Set skip_path_invariant: true for extension
+# repos like PFS where sources live in the git root without a full dump layout.
 #
-# mcp_servers lists logical names; URLs are assembled from
-# project.codemeta_port + vm_docker_host (below) by
-# templates/analyst-mcp.json.tpl.
-#
-# extra_writable_dir (OPTIONAL) — second `--add-dir` for the implementer's
-# claude session. Used when path_local is a read-only XML mirror (for
-# codemetadata MCP) and the actual git push target (implementer's real
-# working tree with its own gitea remote) lives elsewhere. Gating
-# pre-checks 2..4 in spawn-implementer.ps1 still operate ONLY on path_local
-# — extra_writable_dir is a writable hint only, not an INVARIANT.
+# MCP wiring — choose one:
+#   A) codemeta_port + vm_docker_host → templates/*-mcp.json.tpl (docker codemetadata)
+#   B) mcp_config_file → static JSON copied into each task (local MCP stack)
 
-vm_docker_host: <vm-docker-host>
+vm_docker_host: localhost
 
 projects:
+
+  # PFS — расширение + локальный стек 1C MCP (см. PFS/.cursor/mcp.json)
+  pfs:
+    path_local: C:/Tools/DevsProject/ai/PFS
+    skip_path_invariant: true
+    allow_missing_git_remote: true
+    mcp_config_file: config/pfs-mcp.json
+    mcp_servers:
+      - 1c-code-metadata-mcp
+      - 1c-syntax-checker-mcp
+      - 1C-docs-mcp
+      - 1c-templates-mcp
+      - 1c-graph-metadata-mcp
+      - 1c-code-check-mcp
+      - 1c-ssl-mcp
+      - 1c-data-mcp
 
   # Example A: split-mirror project (read-only codemetadata XML dump +
   # separate writable git workspace where the implementer commits).
   example-trade:
-    # Read-only XML dump indexed by codemetadata-<example-trade> MCP.
     path_local: <workspace>/1c-projects/example-trade/src
-    # Writable git target with its own Gitea remote — where the
-    # implementer creates `orchestrator/<task_id>` branch and pushes.
     extra_writable_dir: <workspace>/1c-exchange/example-trade
     codemeta_port: 7630
     mcp_servers: [codemetadata]

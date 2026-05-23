@@ -1,0 +1,9 @@
+# Orchestrator runtime configuration (Cursor edition)
+
+cursor:
+  # Default model for all L3 phases. Override per spawn with -Model on auditor
+  # or ORCH_CURSOR_MODEL env var.
+  model: composer-2.5
+  api_key_env: CURSOR_API_KEY
+  # Inline-only SDK config (do not load ambient Cursor user settings).
+  setting_sources: []

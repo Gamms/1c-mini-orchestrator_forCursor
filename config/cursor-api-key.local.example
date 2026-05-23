@@ -1,0 +1,6 @@
+# Скопируйте как config/cursor-api-key.local и вставьте ключ (одна строка).
+# Файл в .gitignore — в git не попадёт.
+#
+# Формат — любой из:
+#   crsr_xxxxxxxx...
+#   CURSOR_API_KEY=crsr_xxxxxxxx...

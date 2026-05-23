@@ -85,6 +85,27 @@ def _norm(path: str) -> str:
     return path.replace("\\", "/").lstrip("/")
 
 
+def _packet_runtime(*paths: Path) -> str:
+    for path in paths:
+        if not path.exists():
+            continue
+        try:
+            packet = json.loads(path.read_text(encoding="utf-8-sig"))
+        except json.JSONDecodeError:
+            continue
+        runtime = str(packet.get("runtime", "") or "")
+        if runtime:
+            return runtime
+    return ""
+
+
+def _count_cursor_mcp_raw(task_root: Path, subdir: str) -> int:
+    raw = task_root / subdir
+    if not raw.is_dir():
+        return 0
+    return sum(1 for _ in raw.rglob("*.json"))
+
+
 def _compute_verdict(findings: list) -> str:
     """Severity-driven computed verdict (per audit_v1 + Phase 4 SDD §5.5.2)."""
     blockers = sum(1 for f in findings if f.severity == "blocker")
@@ -278,111 +299,151 @@ def main(argv: list[str]) -> int:
         )
         return EXIT_GATE_A_STALE
 
-    # ---- Session.jsonl gates 6/7/8 ----
-    session_dir = ""
-    writer_cutoff_ts: float | None = None
-    impl_cutoff_ts: float | None = None
-
-    if impl_pkt_path.exists():
-        try:
-            ip = json.loads(impl_pkt_path.read_text(encoding="utf-8-sig"))
-            session_dir = ip.get("session_dir", "") or ""
-            impl_cutoff_ts = parse_iso(ip.get("created_at", "") or "")
-        except json.JSONDecodeError:
-            pass
-
-    if writer_pkt_path.exists():
-        try:
-            wp = json.loads(writer_pkt_path.read_text(encoding="utf-8-sig"))
-            if not session_dir:
-                session_dir = wp.get("analyst_session_dir", "") or ""
-            writer_cutoff_ts = parse_iso(wp.get("created_at", "") or "")
-        except json.JSONDecodeError:
-            pass
-
-    if not session_dir or not Path(session_dir).exists():
-        print(
-            "session.jsonl dir not found (implementer_packet.session_dir / "
-            "sdd_writer_packet.analyst_session_dir both missing) -- "
-            "cannot verify real-MCP gates 6/7/8",
-            file=sys.stderr,
-        )
-        return EXIT_ANALYST_NO_MCP
-
-    analyst_files, writer_files, impl_files = partition_jsonls_3way(
-        Path(session_dir), writer_cutoff_ts, impl_cutoff_ts
+    # ---- Session.jsonl gates 6/7/8 (cursor: *_raw dirs) ----
+    runtime = _packet_runtime(
+        auditor_pkt_path,
+        impl_pkt_path,
+        writer_pkt_path,
+        task_root / "task_packet.json",
     )
+    analyst_mcp = 0
+    writer_mcp = 0
+    impl_mcp = 0
+    auditor_mcp = 0
 
-    if not analyst_files:
-        print(f"no analyst session.jsonl found in {session_dir}", file=sys.stderr)
-        return EXIT_ANALYST_NO_MCP
-    analyst_mcp = count_mcp_in_jsonls(analyst_files)
-    if analyst_mcp == 0:
-        print(
-            "input analysis was synthesized without real MCP "
-            f"(0 mcp__ tool_use in {[str(p) for p in analyst_files]})",
-            file=sys.stderr,
-        )
-        return EXIT_ANALYST_NO_MCP
-
-    if not writer_files:
-        print(f"no writer session.jsonl found in {session_dir}", file=sys.stderr)
-        return EXIT_WRITER_NO_MCP
-    writer_mcp = count_mcp_in_jsonls(writer_files)
-    if writer_mcp == 0:
-        print(
-            "sdd_writer did not consult MCP "
-            f"(0 mcp__ tool_use in {[str(p) for p in writer_files]})",
-            file=sys.stderr,
-        )
-        return EXIT_WRITER_NO_MCP
-
-    if not impl_files:
-        print(f"no implementer session.jsonl found in {session_dir}", file=sys.stderr)
-        return EXIT_IMPL_NO_MCP
-    impl_mcp = count_mcp_in_jsonls(impl_files)
-    if impl_mcp == 0:
-        print(
-            "implementer did not consult MCP "
-            f"(0 mcp__ tool_use in {[str(p) for p in impl_files]})",
-            file=sys.stderr,
-        )
-        return EXIT_IMPL_NO_MCP
-
-    # ---- exit 9: auditor codex rollout has 0 MCP function_calls ----
-    auditor_started_at = ""
-    codex_home_str = ""
-    if auditor_pkt_path.exists():
-        try:
-            ap = json.loads(auditor_pkt_path.read_text(encoding="utf-8-sig"))
-            auditor_started_at = ap.get("created_at", "") or ""
-            codex_home_str = ap.get("codex_home", "") or ""
-        except json.JSONDecodeError:
-            pass
-
-    # Test override: ORCH_TEST_CODEX_SESSIONS_ROOT overrides codex_home lookup.
-    test_sessions_root = os.environ.get("ORCH_TEST_CODEX_SESSIONS_ROOT", "")
-    if test_sessions_root:
-        sessions_root: Path | None = Path(test_sessions_root)
-    elif codex_home_str:
-        sessions_root = Path(codex_home_str) / "sessions"
+    if runtime == "cursor":
+        analyst_mcp = _count_cursor_mcp_raw(task_root, "analysis_raw")
+        writer_mcp = _count_cursor_mcp_raw(task_root, "sdd_raw")
+        impl_mcp = _count_cursor_mcp_raw(task_root, "impl_raw")
+        auditor_mcp = _count_cursor_mcp_raw(task_root, "audit_raw")
+        if analyst_mcp == 0:
+            print(
+                "cursor runtime: analysis_raw/ has no MCP evidence -- re-run analyst",
+                file=sys.stderr,
+            )
+            return EXIT_ANALYST_NO_MCP
+        if writer_mcp == 0:
+            print(
+                "cursor runtime: sdd_raw/ has no MCP evidence -- re-run sdd_writer",
+                file=sys.stderr,
+            )
+            return EXIT_WRITER_NO_MCP
+        if impl_mcp == 0:
+            print(
+                "cursor runtime: impl_raw/ has no MCP evidence -- re-run implementer",
+                file=sys.stderr,
+            )
+            return EXIT_IMPL_NO_MCP
+        if auditor_mcp == 0:
+            print(
+                "cursor runtime: audit_raw/ has no MCP evidence -- auditor did not consult MCP",
+                file=sys.stderr,
+            )
+            return EXIT_AUDITOR_NO_MCP
     else:
-        sessions_root = None  # falls back to $CODEX_HOME or ~/.codex inside helper
+        session_dir = ""
+        writer_cutoff_ts: float | None = None
+        impl_cutoff_ts: float | None = None
 
-    rollout = find_rollout_for_session(
-        auditor_started_at,
-        sessions_root=sessions_root,
-        tolerance_seconds=600.0,
-    )
-    auditor_mcp = count_mcp_tool_use(rollout) if rollout else 0
-    if auditor_mcp == 0:
-        loc = str(rollout) if rollout else "<no rollout found>"
-        print(
-            "auditor did not issue any MCP query of its own "
-            f"(0 MCP function_call entries in {loc})",
-            file=sys.stderr,
+        if impl_pkt_path.exists():
+            try:
+                ip = json.loads(impl_pkt_path.read_text(encoding="utf-8-sig"))
+                session_dir = ip.get("session_dir", "") or ""
+                impl_cutoff_ts = parse_iso(ip.get("created_at", "") or "")
+            except json.JSONDecodeError:
+                pass
+
+        if writer_pkt_path.exists():
+            try:
+                wp = json.loads(writer_pkt_path.read_text(encoding="utf-8-sig"))
+                if not session_dir:
+                    session_dir = wp.get("analyst_session_dir", "") or ""
+                writer_cutoff_ts = parse_iso(wp.get("created_at", "") or "")
+            except json.JSONDecodeError:
+                pass
+
+        if not session_dir or not Path(session_dir).exists():
+            print(
+                "session.jsonl dir not found (implementer_packet.session_dir / "
+                "sdd_writer_packet.analyst_session_dir both missing) -- "
+                "cannot verify real-MCP gates 6/7/8",
+                file=sys.stderr,
+            )
+            return EXIT_ANALYST_NO_MCP
+
+        analyst_files, writer_files, impl_files = partition_jsonls_3way(
+            Path(session_dir), writer_cutoff_ts, impl_cutoff_ts
         )
-        return EXIT_AUDITOR_NO_MCP
+
+        if not analyst_files:
+            print(f"no analyst session.jsonl found in {session_dir}", file=sys.stderr)
+            return EXIT_ANALYST_NO_MCP
+        analyst_mcp = count_mcp_in_jsonls(analyst_files)
+        if analyst_mcp == 0:
+            print(
+                "input analysis was synthesized without real MCP "
+                f"(0 mcp__ tool_use in {[str(p) for p in analyst_files]})",
+                file=sys.stderr,
+            )
+            return EXIT_ANALYST_NO_MCP
+
+        if not writer_files:
+            print(f"no writer session.jsonl found in {session_dir}", file=sys.stderr)
+            return EXIT_WRITER_NO_MCP
+        writer_mcp = count_mcp_in_jsonls(writer_files)
+        if writer_mcp == 0:
+            print(
+                "sdd_writer did not consult MCP "
+                f"(0 mcp__ tool_use in {[str(p) for p in writer_files]})",
+                file=sys.stderr,
+            )
+            return EXIT_WRITER_NO_MCP
+
+        if not impl_files:
+            print(f"no implementer session.jsonl found in {session_dir}", file=sys.stderr)
+            return EXIT_IMPL_NO_MCP
+        impl_mcp = count_mcp_in_jsonls(impl_files)
+        if impl_mcp == 0:
+            print(
+                "implementer did not consult MCP "
+                f"(0 mcp__ tool_use in {[str(p) for p in impl_files]})",
+                file=sys.stderr,
+            )
+            return EXIT_IMPL_NO_MCP
+
+        # ---- exit 9: auditor codex rollout has 0 MCP function_calls ----
+        auditor_started_at = ""
+        codex_home_str = ""
+        if auditor_pkt_path.exists():
+            try:
+                ap = json.loads(auditor_pkt_path.read_text(encoding="utf-8-sig"))
+                auditor_started_at = ap.get("created_at", "") or ""
+                codex_home_str = ap.get("codex_home", "") or ""
+            except json.JSONDecodeError:
+                pass
+
+        test_sessions_root = os.environ.get("ORCH_TEST_CODEX_SESSIONS_ROOT", "")
+        if test_sessions_root:
+            sessions_root: Path | None = Path(test_sessions_root)
+        elif codex_home_str:
+            sessions_root = Path(codex_home_str) / "sessions"
+        else:
+            sessions_root = None
+
+        rollout = find_rollout_for_session(
+            auditor_started_at,
+            sessions_root=sessions_root,
+            tolerance_seconds=600.0,
+        )
+        auditor_mcp = count_mcp_tool_use(rollout) if rollout else 0
+        if auditor_mcp == 0:
+            loc = str(rollout) if rollout else "<no rollout found>"
+            print(
+                "auditor did not issue any MCP query of its own "
+                f"(0 MCP function_call entries in {loc})",
+                file=sys.stderr,
+            )
+            return EXIT_AUDITOR_NO_MCP
 
     # ---- Gate B: Orchestrator/ has changes outside tasks/<task_id>/ ----
     orch_root_env = os.environ.get("ORCH_TEST_ORCHESTRATOR_ROOT", "")

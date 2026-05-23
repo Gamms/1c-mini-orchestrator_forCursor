@@ -1,11 +1,7 @@
 #requires -Version 5
 <#
 .SYNOPSIS
-    Child wrapper inside the spawned wt tab for sdd_writer.
-.DESCRIPTION
-    Sets CWD to TaskRoot, reads prompt.sdd-writer.md, invokes claude
-    with task-scoped .mcp.sdd-writer.json (strict) + add-dir for the
-    project (read-only) and orchestrator root.
+    Child wrapper: runs L3 sdd_writer via Cursor SDK.
 #>
 param(
     [Parameter(Mandatory=$true)][string]$TaskRoot,
@@ -14,28 +10,22 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "_cursor-lib.ps1")
+
+if (-not (Test-CursorApiKey)) { exit 1 }
 
 Set-Location -Path $TaskRoot
 
-$promptPath = Join-Path $TaskRoot "prompt.sdd-writer.md"
-if (-not (Test-Path $promptPath)) {
-    Write-Error "prompt.sdd-writer.md not found at $promptPath"
-    exit 1
-}
-$prompt = Get-Content -Path $promptPath -Raw -Encoding UTF8
-
-$mcpConfig = Join-Path $TaskRoot ".mcp.sdd-writer.json"
-
-Write-Host "L3 sdd-writer -- task_root: $TaskRoot"
-Write-Host "L3 sdd-writer -- project_path: $ProjectPath"
-Write-Host "L3 sdd-writer -- orchestrator_root: $OrchestratorRoot"
-Write-Host "L3 sdd-writer -- mcp_config: $mcpConfig"
+Write-Host "L3 sdd-writer (Cursor) -- task_root: $TaskRoot"
+Write-Host "L3 sdd-writer (Cursor) -- project_path: $ProjectPath"
+Write-Host "L3 sdd-writer (Cursor) -- orchestrator_root: $OrchestratorRoot"
 Write-Host ""
 
-& claude `
-    --dangerously-skip-permissions `
-    --add-dir $ProjectPath `
-    --add-dir $OrchestratorRoot `
-    --mcp-config $mcpConfig `
-    --strict-mcp-config `
-    -- $prompt
+$py = Get-OrchestratorPython
+$runner = Get-CursorRunnerScript
+& $py $runner `
+    --phase sdd-writer `
+    --task-root $TaskRoot `
+    --project-path $ProjectPath `
+    --orchestrator-root $OrchestratorRoot
+exit $LASTEXITCODE

@@ -21,45 +21,7 @@ param(
 
 $ErrorActionPreference = "Continue"
 
-function Encode-ClaudePath {
-    param([Parameter(Mandatory=$true)][string]$Path)
-    $enc = $Path -replace ':', '-' -replace '\\', '-' -replace '/', '-'
-    return $enc.TrimStart('-')
-}
-
-function Write-PreTrust {
-    param([Parameter(Mandatory=$true)][string]$AbsPath)
-    $encoded = Encode-ClaudePath $AbsPath
-    $variants = @($encoded)
-    if ($encoded.Length -ge 1) {
-        $first = $encoded.Substring(0,1)
-        if ([char]::IsLetter($first)) {
-            $alt = ($first.ToString().ToUpper() + $encoded.Substring(1))
-            if ($alt -ne $encoded) { $variants += $alt }
-            $altLow = ($first.ToString().ToLower() + $encoded.Substring(1))
-            if ($altLow -ne $encoded -and $variants -notcontains $altLow) {
-                $variants += $altLow
-            }
-        }
-    }
-    $projectsRoot = Join-Path $env:USERPROFILE ".claude\projects"
-    foreach ($v in $variants) {
-        $dir = Join-Path $projectsRoot $v
-        if (-not (Test-Path $dir)) {
-            New-Item -ItemType Directory -Path $dir -Force | Out-Null
-        }
-        $settings = Join-Path $dir "settings.json"
-        $obj = [ordered]@{ trusted = $true }
-        if (Test-Path $settings) {
-            try {
-                $existing = Get-Content -Path $settings -Raw -Encoding UTF8 | ConvertFrom-Json
-                $existing | Add-Member -NotePropertyName trusted -NotePropertyValue $true -Force
-                $obj = $existing
-            } catch { }
-        }
-        ($obj | ConvertTo-Json -Compress) | Out-File -FilePath $settings -Encoding utf8
-    }
-}
+. (Join-Path $PSScriptRoot "_cursor-lib.ps1")
 
 $OrchestratorRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $OrchestratorRoot = $OrchestratorRoot -replace '\\', '/'
@@ -99,7 +61,7 @@ if (-not $ProjectId) {
 # (e.g. the D2 path_local fix moved example-erp from example-erp-example-trade-exchange/example-erp to 1c/example-erp-src);
 # writer must use current authoritative path, not the analyst's snapshot.
 $yamlGet = Join-Path $PSScriptRoot "_python\yaml_get.py"
-$yamlOut = & python $yamlGet $ProjectId 2>&1
+$yamlOut = & (Get-OrchestratorPython) $yamlGet $ProjectId 2>&1
 $yamlExit = $LASTEXITCODE
 if ($yamlExit -ne 0) {
     [Console]::Error.WriteLine("yaml_get.py exit=$yamlExit for project '$ProjectId': $yamlOut")
@@ -113,15 +75,17 @@ $ProjectPath  = $cfg['path_local']
 $CodemetaPort = $cfg['codemeta_port']
 $VmDockerHost = $cfg['vm_docker_host']
 
-if (-not $ProjectPath -or -not $CodemetaPort -or -not $VmDockerHost) {
+if (-not (Test-ProjectRegistryComplete -Cfg $cfg)) {
     [Console]::Error.WriteLine("yaml_get returned incomplete data for $ProjectId : $yamlOut")
     exit 1
 }
 
-$CodemetaUrl = "http://{0}:{1}/mcp" -f $VmDockerHost, $CodemetaPort
+$CodemetaUrl = Get-ProjectCodemetaUrl -Cfg $cfg
 
-if (-not (Test-Path $ProjectPath)) {
-    [Console]::Error.WriteLine("project path does not exist on disk: $ProjectPath")
+try {
+    Test-ProjectPathInvariant -ProjectPath $ProjectPath -Cfg $cfg -ProjectId $ProjectId
+} catch {
+    [Console]::Error.WriteLine($_.Exception.Message)
     exit 1
 }
 
@@ -143,34 +107,12 @@ if (Test-Path $sddMeta) {
 
 # Pre-condition: analysis_report.json must validate
 $validatePy = Join-Path $PSScriptRoot "_python\validate.py"
-$validateOut = & python $validatePy $TaskRoot 2>&1
+$validateOut = & (Get-OrchestratorPython) $validatePy $TaskRoot 2>&1
 $validateExit = $LASTEXITCODE
 if ($validateExit -ne 0) {
     [Console]::Error.WriteLine("analysis_report.json did not validate (exit=$validateExit). Run validate-analysis.ps1 first.")
     [Console]::Error.WriteLine($validateOut)
     exit 5
-}
-
-# path_local INVARIANT (mirror spawn-analyst.ps1 lines 98-109)
-$cfgXml = Join-Path $ProjectPath "Configuration.xml"
-$catalogsDir = Join-Path $ProjectPath "Catalogs"
-if (-not (Test-Path $cfgXml) -or -not (Test-Path $catalogsDir)) {
-    [Console]::Error.WriteLine("project_path is not a 1C XML-dump root: $ProjectPath")
-    [Console]::Error.WriteLine("expected Configuration.xml + Catalogs/ directly under path_local.")
-    exit 1
-}
-
-# Resolve analyst session.jsonl dir BEFORE spawning the writer.
-# At this moment, only the analyst session exists for this task_id;
-# after wt spawn a new dir appears for the writer.
-$projectsRoot = Join-Path $env:USERPROFILE ".claude\projects"
-$analystSessionDir = ""
-if (Test-Path $projectsRoot) {
-    $candidates = Get-ChildItem -Path $projectsRoot -Directory -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -like "*Orchestrator*tasks*$TaskId*" }
-    if ($candidates) {
-        $analystSessionDir = ($candidates | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
-    }
 }
 
 # Ensure sdd_raw exists
@@ -179,8 +121,7 @@ if (-not (Test-Path $sddRaw)) {
 }
 
 # Render templates
-$claudeTpl = Get-Content -Path (Join-Path $OrchestratorRoot "templates/sdd-writer-CLAUDE.md.tpl") -Raw -Encoding UTF8
-$mcpTpl    = Get-Content -Path (Join-Path $OrchestratorRoot "templates/sdd-writer-mcp.json.tpl")    -Raw -Encoding UTF8
+$agentsTpl = Get-Content -Path (Join-Path $OrchestratorRoot "templates/sdd-writer-AGENTS.md.tpl") -Raw -Encoding UTF8
 
 $subst = @{
     "{PROJECT_ID}"          = $ProjectId
@@ -192,15 +133,19 @@ $subst = @{
     "{CODEMETADATA_URL}"    = $CodemetaUrl
     "{ANALYSIS_REPORT_REL}" = "analysis_report.json"
 }
-$claudeRendered = $claudeTpl
-$mcpRendered    = $mcpTpl
+$agentsRendered = $agentsTpl
 foreach ($k in $subst.Keys) {
-    $claudeRendered = $claudeRendered.Replace($k, $subst[$k])
-    $mcpRendered    = $mcpRendered.Replace($k,    $subst[$k])
+    $agentsRendered = $agentsRendered.Replace($k, $subst[$k])
 }
 
-$claudeRendered | Out-File -FilePath (Join-Path $TaskRoot "CLAUDE.sdd-writer.md") -Encoding utf8
-$mcpRendered    | Out-File -FilePath (Join-Path $TaskRoot ".mcp.sdd-writer.json") -Encoding utf8
+$agentsRendered | Out-File -FilePath (Join-Path $TaskRoot "AGENTS.sdd-writer.md") -Encoding utf8
+Write-TaskMcpConfig `
+    -OrchestratorRoot $OrchestratorRoot `
+    -TaskRoot $TaskRoot `
+    -DestFileName ".mcp.sdd-writer.json" `
+    -Cfg $cfg `
+    -TemplateRelativePath "templates/sdd-writer-mcp.json.tpl" `
+    -Subst $subst
 
 $wtTitle = "sdd-writer:$TaskId"
 $writerPacket = [ordered]@{
@@ -212,28 +157,23 @@ $writerPacket = [ordered]@{
     orchestrator_root          = $OrchestratorRoot
     task_root                  = $TaskRoot
     created_at                 = (Get-Date).ToUniversalTime().ToString("o")
-    analyst_session_dir        = $analystSessionDir
-    expected_session_dir_hint  = (Encode-ClaudePath $TaskRoot)
+    runtime                    = "cursor"
     wt_window_title            = $wtTitle
 }
 ($writerPacket | ConvertTo-Json -Depth 10) | Out-File -FilePath (Join-Path $TaskRoot "sdd_writer_packet.json") -Encoding utf8
 
 $promptLines = @(
-    "Read ./CLAUDE.sdd-writer.md in the current directory - it is your contract and lists absolute paths to prompts/skills/schemas.",
-    "Then follow prompts/sdd-writer.md (linked from that CLAUDE.sdd-writer.md). One pass, output sdd.md + sdd_metadata.json + announce SDD READY."
+    "Read ./AGENTS.sdd-writer.md in the current directory - it is your contract and lists absolute paths to prompts/skills/schemas.",
+    "Then follow prompts/sdd-writer.md (linked from that AGENTS.sdd-writer.md). One pass, output sdd.md + sdd_metadata.json + announce SDD READY."
 )
 ($promptLines -join "`r`n") | Out-File -FilePath (Join-Path $TaskRoot "prompt.sdd-writer.md") -Encoding utf8
-
-Write-PreTrust -AbsPath $TaskRoot
-Write-PreTrust -AbsPath $OrchestratorRoot
 
 $result = [ordered]@{
     task_id                   = $TaskId
     task_root                 = $TaskRoot
     project_path              = $ProjectPath
     wt_window_title           = $wtTitle
-    expected_session_dir_hint = $writerPacket.expected_session_dir_hint
-    analyst_session_dir       = $analystSessionDir
+    runtime                   = "cursor"
     prepare_only              = [bool]$PrepareOnly.IsPresent
 }
 
@@ -241,6 +181,8 @@ if ($PrepareOnly) {
     ($result | ConvertTo-Json -Compress)
     exit 0
 }
+
+if (-not (Test-CursorApiKey)) { exit 3 }
 
 $wt = Get-Command wt.exe -ErrorAction SilentlyContinue
 if (-not $wt) {

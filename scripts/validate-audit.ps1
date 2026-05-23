@@ -9,6 +9,7 @@ param(
 )
 
 $ErrorActionPreference = "Continue"
+. (Join-Path $PSScriptRoot "_cursor-lib.ps1")
 $OrchestratorRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $TaskRoot = Join-Path $OrchestratorRoot "tasks\$TaskId"
 
@@ -18,5 +19,5 @@ if (-not (Test-Path $TaskRoot)) {
 }
 
 $validatePy = Join-Path $PSScriptRoot "_python\validate_audit.py"
-& python $validatePy $TaskRoot
+& (Get-OrchestratorPython) $validatePy $TaskRoot
 exit $LASTEXITCODE

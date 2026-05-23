@@ -1,7 +1,7 @@
 #requires -Version 5
 <#
 .SYNOPSIS
-    Child wrapper inside the spawned wt tab. Runs claude with task context.
+    Child wrapper: runs L3 analyst via Cursor SDK.
 #>
 param(
     [Parameter(Mandatory=$true)][string]$TaskRoot,
@@ -10,28 +10,22 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "_cursor-lib.ps1")
+
+if (-not (Test-CursorApiKey)) { exit 1 }
 
 Set-Location -Path $TaskRoot
 
-$promptPath = Join-Path $TaskRoot "prompt.md"
-if (-not (Test-Path $promptPath)) {
-    Write-Error "prompt.md not found at $promptPath"
-    exit 1
-}
-$prompt = Get-Content -Path $promptPath -Raw -Encoding UTF8
-
-$mcpConfig = Join-Path $TaskRoot ".mcp.json"
-
-Write-Host "L3 analyst -- task_root: $TaskRoot"
-Write-Host "L3 analyst -- project_path: $ProjectPath"
-Write-Host "L3 analyst -- orchestrator_root: $OrchestratorRoot"
-Write-Host "L3 analyst -- mcp_config: $mcpConfig"
+Write-Host "L3 analyst (Cursor) -- task_root: $TaskRoot"
+Write-Host "L3 analyst (Cursor) -- project_path: $ProjectPath"
+Write-Host "L3 analyst (Cursor) -- orchestrator_root: $OrchestratorRoot"
 Write-Host ""
 
-& claude `
-    --dangerously-skip-permissions `
-    --add-dir $ProjectPath `
-    --add-dir $OrchestratorRoot `
-    --mcp-config $mcpConfig `
-    --strict-mcp-config `
-    -- $prompt
+$py = Get-OrchestratorPython
+$runner = Get-CursorRunnerScript
+& $py $runner `
+    --phase analyst `
+    --task-root $TaskRoot `
+    --project-path $ProjectPath `
+    --orchestrator-root $OrchestratorRoot
+exit $LASTEXITCODE

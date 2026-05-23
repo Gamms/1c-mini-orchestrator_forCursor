@@ -71,6 +71,46 @@ def _norm(path: str) -> str:
     return path.replace("\\", "/").lstrip("/")
 
 
+def _decode_git_path(path: str) -> str:
+    """Normalize git --name-only lines (quoted paths, octal UTF-8 escapes on Windows)."""
+    p = path.strip().strip('"')
+    out = bytearray()
+    i = 0
+    while i < len(p):
+        if (
+            p[i] == "\\"
+            and i + 3 < len(p)
+            and all(c in "01234567" for c in p[i + 1 : i + 4])
+        ):
+            out.append(int(p[i + 1 : i + 4], 8))
+            i += 4
+        else:
+            out.extend(p[i].encode("ascii"))
+            i += 1
+    return _norm(out.decode("utf-8"))
+
+
+def _packet_runtime(*paths: Path) -> str:
+    for path in paths:
+        if not path.exists():
+            continue
+        try:
+            packet = json.loads(path.read_text(encoding="utf-8-sig"))
+        except json.JSONDecodeError:
+            continue
+        runtime = str(packet.get("runtime", "") or "")
+        if runtime:
+            return runtime
+    return ""
+
+
+def _count_cursor_mcp_raw(task_root: Path, subdir: str) -> int:
+    raw = task_root / subdir
+    if not raw.is_dir():
+        return 0
+    return sum(1 for _ in raw.rglob("*.json"))
+
+
 def _summary(
     meta: ImplementationResult,
     analyst_mcp: int,
@@ -219,90 +259,127 @@ def main(argv: list[str]) -> int:
         )
         return EXIT_GATE_A_BRANCH
 
-    # ---- Session.jsonl gates 6/7/8 ----
-    session_dir = ""
-    writer_cutoff_ts: float | None = None
-    impl_cutoff_ts: float | None = None
+    # ---- Session.jsonl gates 6/7/8 (cursor: impl_raw / analysis_raw / sdd_raw) ----
+    runtime = _packet_runtime(
+        impl_packet_path,
+        writer_packet_path,
+        task_root / "task_packet.json",
+    )
+    analyst_mcp = 0
+    writer_mcp = 0
+    impl_mcp = 0
     orch_porcelain_baseline: set[str] = set()
-
     if impl_packet_path.exists():
         try:
             ip = json.loads(impl_packet_path.read_text(encoding="utf-8-sig"))
-            session_dir = ip.get("session_dir", "") or ""
-            impl_cutoff_ts = parse_iso(ip.get("created_at", "") or "")
             for ln in ip.get("orch_porcelain_baseline") or []:
                 if isinstance(ln, str) and ln.strip():
                     orch_porcelain_baseline.add(ln.rstrip())
         except json.JSONDecodeError:
             pass
 
-    if writer_packet_path.exists():
-        try:
-            wp = json.loads(writer_packet_path.read_text(encoding="utf-8-sig"))
-            if not session_dir:
-                session_dir = wp.get("analyst_session_dir", "") or ""
-            writer_cutoff_ts = parse_iso(wp.get("created_at", "") or "")
-        except json.JSONDecodeError:
-            pass
+    if runtime == "cursor":
+        analyst_mcp = _count_cursor_mcp_raw(task_root, "analysis_raw")
+        writer_mcp = _count_cursor_mcp_raw(task_root, "sdd_raw")
+        impl_mcp = _count_cursor_mcp_raw(task_root, "impl_raw")
+        if analyst_mcp == 0:
+            print(
+                "cursor runtime: analysis_raw/ has no MCP evidence -- re-run analyst",
+                file=sys.stderr,
+            )
+            return EXIT_ANALYST_NO_MCP
+        if writer_mcp == 0:
+            print(
+                "cursor runtime: sdd_raw/ has no MCP evidence -- re-run sdd_writer",
+                file=sys.stderr,
+            )
+            return EXIT_WRITER_NO_MCP
+        if impl_mcp == 0:
+            print(
+                "cursor runtime: impl_raw/ has no MCP evidence -- implementer did not consult MCP",
+                file=sys.stderr,
+            )
+            return EXIT_IMPL_NO_MCP
+    else:
+        session_dir = ""
+        writer_cutoff_ts: float | None = None
+        impl_cutoff_ts: float | None = None
 
-    if not session_dir or not Path(session_dir).exists():
-        print(
-            "session.jsonl dir not found (implementer_packet.session_dir / "
-            "sdd_writer_packet.analyst_session_dir both missing or cleared) -- "
-            "cannot verify real-MCP gates 6/7/8",
-            file=sys.stderr,
-        )
-        return EXIT_ANALYST_NO_MCP
+        if impl_packet_path.exists():
+            try:
+                ip = json.loads(impl_packet_path.read_text(encoding="utf-8-sig"))
+                session_dir = ip.get("session_dir", "") or ""
+                impl_cutoff_ts = parse_iso(ip.get("created_at", "") or "")
+            except json.JSONDecodeError:
+                pass
 
-    analyst_files, writer_files, impl_files = partition_jsonls_3way(
-        Path(session_dir), writer_cutoff_ts, impl_cutoff_ts
-    )
+        if writer_packet_path.exists():
+            try:
+                wp = json.loads(writer_packet_path.read_text(encoding="utf-8-sig"))
+                if not session_dir:
+                    session_dir = wp.get("analyst_session_dir", "") or ""
+                writer_cutoff_ts = parse_iso(wp.get("created_at", "") or "")
+            except json.JSONDecodeError:
+                pass
 
-    if not analyst_files:
-        print(
-            f"no analyst session.jsonl found in {session_dir} "
-            f"(writer_cutoff_ts={writer_cutoff_ts}, impl_cutoff_ts={impl_cutoff_ts})",
-            file=sys.stderr,
-        )
-        return EXIT_ANALYST_NO_MCP
-    analyst_mcp = count_mcp_in_jsonls(analyst_files)
-    if analyst_mcp == 0:
-        print(
-            f"input analysis was synthesized without real MCP "
-            f"(0 mcp__ tool_use entries in {[str(p) for p in analyst_files]})",
-            file=sys.stderr,
-        )
-        return EXIT_ANALYST_NO_MCP
+        if not session_dir or not Path(session_dir).exists():
+            print(
+                "session.jsonl dir not found (implementer_packet.session_dir / "
+                "sdd_writer_packet.analyst_session_dir both missing or cleared) -- "
+                "cannot verify real-MCP gates 6/7/8",
+                file=sys.stderr,
+            )
+            return EXIT_ANALYST_NO_MCP
 
-    if not writer_files:
-        print(
-            f"no writer session.jsonl found in {session_dir}",
-            file=sys.stderr,
+        analyst_files, writer_files, impl_files = partition_jsonls_3way(
+            Path(session_dir), writer_cutoff_ts, impl_cutoff_ts
         )
-        return EXIT_WRITER_NO_MCP
-    writer_mcp = count_mcp_in_jsonls(writer_files)
-    if writer_mcp == 0:
-        print(
-            f"sdd_writer did not consult MCP "
-            f"(0 mcp__ tool_use entries in {[str(p) for p in writer_files]})",
-            file=sys.stderr,
-        )
-        return EXIT_WRITER_NO_MCP
 
-    if not impl_files:
-        print(
-            f"no implementer session.jsonl found in {session_dir}",
-            file=sys.stderr,
-        )
-        return EXIT_IMPL_NO_MCP
-    impl_mcp = count_mcp_in_jsonls(impl_files)
-    if impl_mcp == 0:
-        print(
-            f"implementer did not consult MCP "
-            f"(0 mcp__ tool_use entries in {[str(p) for p in impl_files]})",
-            file=sys.stderr,
-        )
-        return EXIT_IMPL_NO_MCP
+        if not analyst_files:
+            print(
+                f"no analyst session.jsonl found in {session_dir} "
+                f"(writer_cutoff_ts={writer_cutoff_ts}, impl_cutoff_ts={impl_cutoff_ts})",
+                file=sys.stderr,
+            )
+            return EXIT_ANALYST_NO_MCP
+        analyst_mcp = count_mcp_in_jsonls(analyst_files)
+        if analyst_mcp == 0:
+            print(
+                f"input analysis was synthesized without real MCP "
+                f"(0 mcp__ tool_use entries in {[str(p) for p in analyst_files]})",
+                file=sys.stderr,
+            )
+            return EXIT_ANALYST_NO_MCP
+
+        if not writer_files:
+            print(
+                f"no writer session.jsonl found in {session_dir}",
+                file=sys.stderr,
+            )
+            return EXIT_WRITER_NO_MCP
+        writer_mcp = count_mcp_in_jsonls(writer_files)
+        if writer_mcp == 0:
+            print(
+                f"sdd_writer did not consult MCP "
+                f"(0 mcp__ tool_use entries in {[str(p) for p in writer_files]})",
+                file=sys.stderr,
+            )
+            return EXIT_WRITER_NO_MCP
+
+        if not impl_files:
+            print(
+                f"no implementer session.jsonl found in {session_dir}",
+                file=sys.stderr,
+            )
+            return EXIT_IMPL_NO_MCP
+        impl_mcp = count_mcp_in_jsonls(impl_files)
+        if impl_mcp == 0:
+            print(
+                f"implementer did not consult MCP "
+                f"(0 mcp__ tool_use entries in {[str(p) for p in impl_files]})",
+                file=sys.stderr,
+            )
+            return EXIT_IMPL_NO_MCP
 
     # ---- Gate D: every file changed in branch must be in sdd_metadata.stages[*].deliverables ----
     rc, out, err = _git(
@@ -315,7 +392,7 @@ def main(argv: list[str]) -> int:
             file=sys.stderr,
         )
         return EXIT_GATE_D_OUT_OF_SCOPE
-    branch_changed = {_norm(p) for p in out.splitlines() if p.strip()}
+    branch_changed = {_decode_git_path(p) for p in out.splitlines() if p.strip()}
 
     deliverables_union: set[str] = set()
     stages = sdd_meta_data.get("stages") if isinstance(sdd_meta_data, dict) else None

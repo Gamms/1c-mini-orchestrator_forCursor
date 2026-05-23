@@ -1,14 +1,13 @@
 #requires -Version 5
 <#
 .SYNOPSIS
-    Spawn an L3 auditor (codex runtime) in a new Windows Terminal tab.
+    Spawn an L3 auditor (Cursor agent) in a new Windows Terminal tab.
 .DESCRIPTION
-    Resolves an existing tasks/<task_id>/ produced by Phases 1-3
-    (analyst -> sdd_writer -> implementer), runs six gating pre-checks
-    per Phase 4 SDD section 5.4.1, renders auditor templates, writes
-    auditor_packet.json + prompt.auditor.md + audit_raw/, pre-trusts
-    CWD + orchestrator root + path_local (read-only adds for codex),
-    then launches wt.exe nt with _run-auditor.ps1.
+    Resolves an existing tasks/<task_id>/ produced by Phases 1-3,
+    runs gating pre-checks per Phase 4 SDD section 5.4.1, renders
+    auditor templates, writes auditor_packet.json + prompt.auditor.md
+    + audit_raw/, then launches wt.exe nt with _run-auditor.ps1
+    (Cursor SDK).
 
     Six gating pre-checks (Phase 4 SDD section 5.4.1):
       1. sdd.md + sdd_metadata.json + impl_metadata.json + analysis_report.json
@@ -17,28 +16,13 @@
       3. git_target_dir has branch 'orchestrator/<TaskId>'           -> exit 6
       4. git_target_dir git status clean                             -> exit 7
       5. audit_report.json not pre-existing (unless -Force)          -> exit 8
-      6. codex executable resolvable on PATH                         -> exit 2
 
     git_target_dir = $ExtraWritableDir when set in projects.yaml,
-    else $PathLocal. Symmetric with spawn-implementer.ps1 (commit
-    1730a7f Phase 6 fix).
-
-    Phase 4 deviates from Phase 3 spawn shape in two ways:
-      a) No gitea-remote check: auditor is fully read-only over
-         path_local; it never pushes. Implementer already verified +
-         pushed the branch.
-      b) Per-task codex config delivered via CODEX_HOME redirect, NOT
-         a --config flag (Stage 0 finding: codex 0.130.0 has no
-         --config <path> option). Rendered config lands at
-         <task_root>\.codex_home\config.toml; _run-auditor.ps1 sets
-         $env:CODEX_HOME = <task_root>\.codex_home before codex exec.
+    else $PathLocal. Symmetric with spawn-implementer.ps1.
 
     -PrepareOnly: do everything EXCEPT the final wt.exe spawn.
     -Force: allow re-running on a task that already has audit_report.json.
-            Removes the stale audit_report.json + audit_raw/ from the task
-            root before rendering.
-    -Model: optional override for codex model selection. Empty string ->
-            no -m flag passed (codex uses its default).
+    -Model: optional override for Cursor model selection.
 #>
 param(
     [Parameter(Mandatory=$true)][string]$TaskId,
@@ -49,45 +33,7 @@ param(
 
 $ErrorActionPreference = "Continue"
 
-function Encode-ClaudePath {
-    param([Parameter(Mandatory=$true)][string]$Path)
-    $enc = $Path -replace ':', '-' -replace '\\', '-' -replace '/', '-'
-    return $enc.TrimStart('-')
-}
-
-function Write-PreTrust {
-    param([Parameter(Mandatory=$true)][string]$AbsPath)
-    $encoded = Encode-ClaudePath $AbsPath
-    $variants = @($encoded)
-    if ($encoded.Length -ge 1) {
-        $first = $encoded.Substring(0,1)
-        if ([char]::IsLetter($first)) {
-            $alt = ($first.ToString().ToUpper() + $encoded.Substring(1))
-            if ($alt -ne $encoded) { $variants += $alt }
-            $altLow = ($first.ToString().ToLower() + $encoded.Substring(1))
-            if ($altLow -ne $encoded -and $variants -notcontains $altLow) {
-                $variants += $altLow
-            }
-        }
-    }
-    $projectsRoot = Join-Path $env:USERPROFILE ".claude\projects"
-    foreach ($v in $variants) {
-        $dir = Join-Path $projectsRoot $v
-        if (-not (Test-Path $dir)) {
-            New-Item -ItemType Directory -Path $dir -Force | Out-Null
-        }
-        $settings = Join-Path $dir "settings.json"
-        $obj = [ordered]@{ trusted = $true }
-        if (Test-Path $settings) {
-            try {
-                $existing = Get-Content -Path $settings -Raw -Encoding UTF8 | ConvertFrom-Json
-                $existing | Add-Member -NotePropertyName trusted -NotePropertyValue $true -Force
-                $obj = $existing
-            } catch { }
-        }
-        ($obj | ConvertTo-Json -Compress) | Out-File -FilePath $settings -Encoding utf8
-    }
-}
+. (Join-Path $PSScriptRoot "_cursor-lib.ps1")
 
 $OrchestratorRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $OrchestratorRoot = $OrchestratorRoot -replace '\\', '/'
@@ -133,7 +79,7 @@ if (-not $ProjectId) {
 # Re-resolve project_path + codemeta_port from current projects.yaml
 # (carry-forward from Phase 3: snapshot in packet may be stale).
 $yamlGet = Join-Path $PSScriptRoot "_python\yaml_get.py"
-$yamlOut = & python $yamlGet $ProjectId 2>&1
+$yamlOut = & (Get-OrchestratorPython) $yamlGet $ProjectId 2>&1
 $yamlExit = $LASTEXITCODE
 if ($yamlExit -ne 0) {
     [Console]::Error.WriteLine("yaml_get.py exit=$yamlExit for project '$ProjectId': $yamlOut")
@@ -148,15 +94,17 @@ $CodemetaPort     = $cfg['codemeta_port']
 $VmDockerHost     = $cfg['vm_docker_host']
 $ExtraWritableDir = $cfg['extra_writable_dir']
 
-if (-not $PathLocal -or -not $CodemetaPort -or -not $VmDockerHost) {
+if (-not (Test-ProjectRegistryComplete -Cfg $cfg)) {
     [Console]::Error.WriteLine("yaml_get returned incomplete data for $ProjectId : $yamlOut")
     exit 1
 }
 
-$CodemetaUrl = "http://{0}:{1}/mcp" -f $VmDockerHost, $CodemetaPort
+$CodemetaUrl = Get-ProjectCodemetaUrl -Cfg $cfg
 
-if (-not (Test-Path $PathLocal)) {
-    [Console]::Error.WriteLine("path_local does not exist on disk: $PathLocal")
+try {
+    Test-ProjectPathInvariant -ProjectPath $PathLocal -Cfg $cfg -ProjectId $ProjectId
+} catch {
+    [Console]::Error.WriteLine($_.Exception.Message)
     exit 1
 }
 
@@ -188,7 +136,7 @@ foreach ($f in @($sddMd, $sddMeta, $implMeta, $analysisRep)) {
     }
 }
 $validateSddPy = Join-Path $PSScriptRoot "_python\validate_sdd.py"
-$sddOut = & python $validateSddPy $TaskRoot 2>&1
+$sddOut = & (Get-OrchestratorPython) $validateSddPy $TaskRoot 2>&1
 $sddExit = $LASTEXITCODE
 if ($sddExit -ne 0) {
     [Console]::Error.WriteLine("validate_sdd.py exit=$sddExit (must be 0 before auditor can run):")
@@ -196,7 +144,7 @@ if ($sddExit -ne 0) {
     exit 5
 }
 $validateImplPy = Join-Path $PSScriptRoot "_python\validate_impl.py"
-$implOut = & python $validateImplPy $TaskRoot 2>&1
+$implOut = & (Get-OrchestratorPython) $validateImplPy $TaskRoot 2>&1
 $implExit = $LASTEXITCODE
 if ($implExit -ne 0) {
     [Console]::Error.WriteLine("validate_impl.py exit=$implExit (must be 0 before auditor can run):")
@@ -204,14 +152,8 @@ if ($implExit -ne 0) {
     exit 5
 }
 
-# ---- Gating pre-check 2: path_local INVARIANT (1C XML-dump root) ----
-$cfgXml      = Join-Path $PathLocal "Configuration.xml"
-$catalogsDir = Join-Path $PathLocal "Catalogs"
-if (-not (Test-Path $cfgXml) -or -not (Test-Path $catalogsDir)) {
-    [Console]::Error.WriteLine("path_local is not a 1C XML-dump root: $PathLocal")
-    [Console]::Error.WriteLine("expected Configuration.xml + Catalogs/ directly under path_local.")
-    exit 1
-}
+# ---- Gating pre-check 2: path_local INVARIANT ----
+# handled by Test-ProjectPathInvariant when skip_path_invariant is false
 
 # ---- Gating pre-check 3: branch orchestrator/<TaskId> exists in git_target_dir ----
 $BranchName = "orchestrator/$TaskId"
@@ -246,7 +188,6 @@ if ($LASTEXITCODE -ne 0 -or -not $BeforeShaAtAuditStart) {
 # ---- Gating pre-check 5: audit_report not pre-existing unless -Force ----
 $auditReportPath = Join-Path $TaskRoot "audit_report.json"
 $auditRawDir     = Join-Path $TaskRoot "audit_raw"
-$codexHomeDir    = Join-Path $TaskRoot ".codex_home"
 
 if (Test-Path $auditReportPath) {
     if ($Force) {
@@ -261,26 +202,16 @@ if (Test-Path $auditReportPath) {
     }
 }
 
-# Ensure audit_raw/ + .codex_home/ exist
-if (-not (Test-Path $auditRawDir))  { New-Item -ItemType Directory -Path $auditRawDir  -Force | Out-Null }
-if (-not (Test-Path $codexHomeDir)) { New-Item -ItemType Directory -Path $codexHomeDir -Force | Out-Null }
-
-# ---- Gating pre-check 6: codex executable resolvable on PATH ----
-$codexCmd = Get-Command codex -ErrorAction SilentlyContinue
-if (-not $codexCmd) {
-    [Console]::Error.WriteLine("codex executable not found on PATH; install codex CLI 0.130.0+ before re-running.")
-    exit 2
-}
+# Ensure audit_raw/ exists
+if (-not (Test-Path $auditRawDir)) { New-Item -ItemType Directory -Path $auditRawDir -Force | Out-Null }
 
 # Render templates
-$claudeTplPath = Join-Path $OrchestratorRoot "templates/auditor-CLAUDE.md.tpl"
-$tomlTplPath   = Join-Path $OrchestratorRoot "templates/auditor-codex.toml.tpl"
-if (-not (Test-Path $claudeTplPath) -or -not (Test-Path $tomlTplPath)) {
-    [Console]::Error.WriteLine("auditor templates missing at $claudeTplPath / $tomlTplPath")
+$agentsTplPath = Join-Path $OrchestratorRoot "templates/auditor-AGENTS.md.tpl"
+if (-not (Test-Path $agentsTplPath)) {
+    [Console]::Error.WriteLine("auditor templates missing at $agentsTplPath")
     exit 1
 }
-$claudeTpl = Get-Content -Path $claudeTplPath -Raw -Encoding UTF8
-$tomlTpl   = Get-Content -Path $tomlTplPath   -Raw -Encoding UTF8
+$agentsTpl = Get-Content -Path $agentsTplPath -Raw -Encoding UTF8
 
 $TaskRootWin = $TaskRoot -replace '/', '\'
 $subst = @{
@@ -299,30 +230,19 @@ $subst = @{
     "{BRANCH_AUDITED}"            = $BranchName
     "{BRANCH_SHA_AT_AUDIT_START}" = $BeforeShaAtAuditStart
 }
-$claudeRendered = $claudeTpl
-$tomlRendered   = $tomlTpl
+$agentsRendered = $agentsTpl
 foreach ($k in $subst.Keys) {
-    $claudeRendered = $claudeRendered.Replace($k, $subst[$k])
-    $tomlRendered   = $tomlRendered.Replace($k,   $subst[$k])
+    $agentsRendered = $agentsRendered.Replace($k, $subst[$k])
 }
 
-$claudeRendered | Out-File -FilePath (Join-Path $TaskRoot "CLAUDE.auditor.md") -Encoding utf8
-$tomlRendered   | Out-File -FilePath (Join-Path $codexHomeDir "config.toml")   -Encoding utf8
-
-# Stage 4 follow-up: when CODEX_HOME is redirected per-task, codex still
-# expects auth.json + installation_id in that same dir. The user's
-# default codex config lives at $env:USERPROFILE\.codex\ -- copy the
-# auth artifacts forward so the per-task home is a self-contained
-# codex environment. Without this, codex 0.130.0 fails with HTTP 401
-# "Missing bearer or basic authentication in header" at session start.
-$defaultCodexHome = Join-Path $env:USERPROFILE ".codex"
-foreach ($authFile in @("auth.json", "installation_id")) {
-    $src = Join-Path $defaultCodexHome $authFile
-    $dst = Join-Path $codexHomeDir $authFile
-    if ((Test-Path $src) -and -not (Test-Path $dst)) {
-        Copy-Item -Path $src -Destination $dst -Force
-    }
-}
+$agentsRendered | Out-File -FilePath (Join-Path $TaskRoot "AGENTS.auditor.md") -Encoding utf8
+Write-TaskMcpConfig `
+    -OrchestratorRoot $OrchestratorRoot `
+    -TaskRoot $TaskRoot `
+    -DestFileName ".mcp.auditor.json" `
+    -Cfg $cfg `
+    -TemplateRelativePath "templates/auditor-mcp.json.tpl" `
+    -Subst $subst
 
 # Capture orchestrator-side porcelain baseline (Gate B parity with Phase 3)
 $orchPorcelainRaw = & git -C $OrchestratorRoot status --porcelain 2>&1
@@ -349,29 +269,20 @@ $audPacket = [ordered]@{
     task_root                  = $TaskRoot
     branch_audited             = $BranchName
     before_sha_at_audit_start  = $BeforeShaAtAuditStart
-    codex_home                 = ($codexHomeDir -replace '/', '\')
     model                      = $Model
     force                      = [bool]$Force.IsPresent
     created_at                 = (Get-Date).ToUniversalTime().ToString("o")
+    runtime                    = "cursor"
     wt_window_title            = $wtTitle
     orch_porcelain_baseline    = @($orchPorcelainLines)
 }
 ($audPacket | ConvertTo-Json -Depth 10) | Out-File -FilePath (Join-Path $TaskRoot "auditor_packet.json") -Encoding utf8
 
 $promptLines = @(
-    "Read ./CLAUDE.auditor.md in the current directory - it is your contract and lists absolute paths to prompts/schemas/inputs.",
-    "Then follow prompts/auditor.md (linked from that CLAUDE.auditor.md). Read-only audit; produce audit_report.json + announce AUDIT READY."
+    "Read ./AGENTS.auditor.md in the current directory - it is your contract and lists absolute paths to prompts/schemas/inputs.",
+    "Then follow prompts/auditor.md (linked from that AGENTS.auditor.md). Read-only audit; produce audit_report.json + announce AUDIT READY."
 )
 ($promptLines -join "`r`n") | Out-File -FilePath (Join-Path $TaskRoot "prompt.auditor.md") -Encoding utf8
-
-# Pre-trust task root + orchestrator + path_local (path_local read-only for codex).
-# Pre-trust extra_writable_dir too when set (codex needs read access to audit it).
-Write-PreTrust -AbsPath $TaskRoot
-Write-PreTrust -AbsPath $OrchestratorRoot
-Write-PreTrust -AbsPath $PathLocal
-if ($ExtraWritableDir) {
-    Write-PreTrust -AbsPath $ExtraWritableDir
-}
 
 $result = [ordered]@{
     task_id                    = $TaskId
@@ -382,9 +293,9 @@ $result = [ordered]@{
     git_target_dir             = $GitTargetDir
     branch_audited             = $BranchName
     before_sha_at_audit_start  = $BeforeShaAtAuditStart
-    codex_home                 = ($codexHomeDir -replace '/', '\')
     model                      = $Model
     wt_window_title            = $wtTitle
+    runtime                    = "cursor"
     prepare_only               = [bool]$PrepareOnly.IsPresent
     force                      = [bool]$Force.IsPresent
 }
@@ -393,6 +304,8 @@ if ($PrepareOnly) {
     ($result | ConvertTo-Json -Compress)
     exit 0
 }
+
+if (-not (Test-CursorApiKey)) { exit 3 }
 
 $wt = Get-Command wt.exe -ErrorAction SilentlyContinue
 if (-not $wt) {

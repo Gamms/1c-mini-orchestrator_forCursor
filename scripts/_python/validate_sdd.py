@@ -50,6 +50,23 @@ EXIT_FF_FAIL = 8
 _HEADING_RE = re.compile(r"^##\s+(\d+)\.\s+", re.M)
 
 
+def _packet_runtime(packet_path: Path) -> str:
+    if not packet_path.exists():
+        return ""
+    try:
+        packet = json.loads(packet_path.read_text(encoding="utf-8-sig"))
+    except json.JSONDecodeError:
+        return ""
+    return str(packet.get("runtime", "") or "")
+
+
+def _count_cursor_mcp_raw(task_root: Path, subdir: str) -> int:
+    raw = task_root / subdir
+    if not raw.is_dir():
+        return 0
+    return sum(1 for _ in raw.rglob("*.json"))
+
+
 def _summary(
     meta: SDDMetadata, analyst_mcp: int, writer_mcp: int
 ) -> str:
@@ -156,6 +173,25 @@ def main(argv: list[str]) -> int:
             file=sys.stderr,
         )
         return EXIT_FF_FAIL
+
+    runtime = _packet_runtime(packet_path)
+    if runtime == "cursor":
+        analyst_mcp = _count_cursor_mcp_raw(task_root, "analysis_raw")
+        writer_mcp = _count_cursor_mcp_raw(task_root, "sdd_raw")
+        if analyst_mcp == 0:
+            print(
+                "cursor runtime: analysis_raw/ has no MCP evidence -- re-run analyst",
+                file=sys.stderr,
+            )
+            return EXIT_ANALYST_NO_MCP
+        if writer_mcp == 0:
+            print(
+                "cursor runtime: sdd_raw/ has no MCP evidence -- writer did not consult MCP",
+                file=sys.stderr,
+            )
+            return EXIT_WRITER_NO_MCP
+        print(_summary(meta, analyst_mcp, writer_mcp))
+        return EXIT_OK
 
     # exit 6/7: partition session.jsonls into analyst vs writer
     analyst_session_dir = ""

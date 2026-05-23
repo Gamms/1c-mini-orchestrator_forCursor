@@ -1,38 +1,19 @@
 #requires -Version 5
 <#
 .SYNOPSIS
-    Phase-agnostic kill for any Orchestrator task. Phase 5 Stage C1.
+    Phase-agnostic kill for any Orchestrator task (Cursor runtime).
 .DESCRIPTION
-    Auto-detects the active phase the same way peek-task.ps1 does --
-    by scanning tasks/<TaskId>/ for known packet files in priority
-    order (auditor -> implementer -> sdd-writer -> analyst). Highest
-    priority existing packet wins.
-
-    Kills wt windows + powershell/pwsh/claude/codex/node processes whose
-    MainWindowTitle matches "<phase>:<TaskId>" (the prefix set by the
-    relevant spawn-*.ps1). Stamps the packet's killed_at field
-    (UTC ISO-8601).
-
-    Title prefix per phase:
-        analyst:<TaskId>
-        sdd-writer:<TaskId>
-        implementer:<TaskId>
-        auditor:<TaskId>
-
-    Replaces the four per-phase wrappers kill-analyst.ps1 /
-    kill-sdd-writer.ps1 / kill-implementer.ps1 / kill-auditor.ps1.
-    Those wrappers remain as thin deprecation shims (Phase 5 Stage C2).
-
-    ASCII-only. PowerShell 5.1.
-    Exit 0: at least one process killed.
-    Exit 1: task_root missing.
-    Exit 2: no matching processes found.
+    Auto-detects the active phase, cancels the Cursor run via SDK when
+    possible, kills wt windows whose title matches "<phase>:<TaskId>",
+    and stamps killed_at on the packet.
 #>
 param(
     [Parameter(Mandatory=$true)][string]$TaskId
 )
 
 $ErrorActionPreference = "Continue"
+. (Join-Path $PSScriptRoot "_cursor-lib.ps1")
+
 $OrchestratorRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $TaskRoot = Join-Path $OrchestratorRoot "tasks\$TaskId"
 
@@ -41,7 +22,6 @@ if (-not (Test-Path $TaskRoot)) {
     exit 1
 }
 
-# Phase descriptors in priority order: later phases supersede earlier ones.
 $phases = @(
     [ordered]@{ Name="auditor";     Packet="auditor_packet.json";     Title="auditor:"     },
     [ordered]@{ Name="implementer"; Packet="implementer_packet.json"; Title="implementer:" },
@@ -63,16 +43,23 @@ foreach ($p in $phases) {
 }
 
 if (-not $detected) {
-    [Console]::Error.WriteLine("no packet found in $TaskRoot (none of: task_packet.json, sdd_writer_packet.json, implementer_packet.json, auditor_packet.json)")
+    [Console]::Error.WriteLine("no packet found in $TaskRoot")
     exit 2
 }
 
 Write-Host ("phase: {0}" -f $detected.Name)
 Write-Host ("title prefix: {0}" -f $detected.Title)
 
-$titleMatch = "*{0}{1}*" -f $detected.Title, $TaskId
 $killed = 0
 
+$cancelHelper = Join-Path $PSScriptRoot "_python\cancel_cursor_run.py"
+if ((Test-Path $cancelHelper) -and (Test-CursorApiKey)) {
+    $py = Get-OrchestratorPython
+    & $py $cancelHelper --task-root $TaskRoot --phase $detected.Name 2>&1 | ForEach-Object { Write-Host $_ }
+    if ($LASTEXITCODE -eq 0) { $killed++ }
+}
+
+$titleMatch = "*{0}{1}*" -f $detected.Title, $TaskId
 $wtProcs = Get-Process -Name "WindowsTerminal","wt" -ErrorAction SilentlyContinue |
     Where-Object { $_.MainWindowTitle -like $titleMatch }
 foreach ($p in $wtProcs) {
@@ -85,8 +72,7 @@ foreach ($p in $wtProcs) {
     }
 }
 
-# claude (Phases 1-3) and codex (Phase 4) plus their host shells / nodes.
-$psProcs = Get-Process -Name "powershell","pwsh","claude","codex","node" -ErrorAction SilentlyContinue |
+$psProcs = Get-Process -Name "powershell","pwsh","python","py" -ErrorAction SilentlyContinue |
     Where-Object { $_.MainWindowTitle -like $titleMatch }
 foreach ($p in $psProcs) {
     try {
@@ -98,7 +84,6 @@ foreach ($p in $psProcs) {
     }
 }
 
-# Stamp killed_at on the packet for audit trail.
 try {
     $packet = Get-Content -Path $detected.PacketPath -Raw -Encoding UTF8 | ConvertFrom-Json
     $packet | Add-Member -NotePropertyName killed_at -NotePropertyValue ((Get-Date).ToUniversalTime().ToString("o")) -Force
@@ -111,5 +96,5 @@ if ($killed -eq 0) {
     Write-Host "no matching processes found for TaskId=$TaskId (title pattern: $titleMatch)"
     exit 2
 }
-Write-Host "killed $killed process(es) for TaskId=$TaskId (phase=$($detected.Name))"
+Write-Host "killed $killed target(s) for TaskId=$TaskId (phase=$($detected.Name))"
 exit 0

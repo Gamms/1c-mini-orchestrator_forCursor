@@ -1,6 +1,6 @@
 """Read projects.yaml and print a project's fields as KEY=VALUE pairs.
 
-Used by spawn-analyst.ps1 to avoid requiring the PowerShell-Yaml module.
+Used by spawn-*.ps1 to avoid requiring the PowerShell-Yaml module.
 Python is already a Phase-1 dependency (validate.py, schemas).
 
 Usage:
@@ -11,7 +11,10 @@ Output (stdout, one per line):
     codemeta_port=...
     mcp_servers=codemetadata,...
     vm_docker_host=...
-    extra_writable_dir=...      (empty string if absent in projects.yaml)
+    extra_writable_dir=...      (empty string if absent)
+    mcp_config_file=...         (empty if absent — use template MCP)
+    skip_path_invariant=true|false
+    allow_missing_git_remote=true|false
 
 Exit codes:
     0  success
@@ -65,7 +68,13 @@ def main(argv: list[str]) -> int:
         return 1
 
     entry = projects[project_id]
-    required = ["path_local", "codemeta_port", "mcp_servers"]
+    mcp_config_file = entry.get("mcp_config_file", "") or ""
+    skip_path_invariant = bool(entry.get("skip_path_invariant", False))
+    allow_missing_git_remote = bool(entry.get("allow_missing_git_remote", False))
+
+    required = ["path_local", "mcp_servers"]
+    if not mcp_config_file:
+        required.extend(["codemeta_port"])
     for field in required:
         if field not in entry:
             print(
@@ -76,11 +85,21 @@ def main(argv: list[str]) -> int:
 
     vm_host = data.get("vm_docker_host", "")
     extra_writable_dir = entry.get("extra_writable_dir", "")
+    codemeta_port = entry.get("codemeta_port", "")
+
     print(f"path_local={entry['path_local']}")
-    print(f"codemeta_port={entry['codemeta_port']}")
-    print(f"mcp_servers={','.join(entry['mcp_servers'])}")
+    print(f"codemeta_port={codemeta_port}")
+    servers = entry["mcp_servers"]
+    if isinstance(servers, str):
+        servers_list = [servers]
+    else:
+        servers_list = list(servers)
+    print(f"mcp_servers={','.join(servers_list)}")
     print(f"vm_docker_host={vm_host}")
     print(f"extra_writable_dir={extra_writable_dir}")
+    print(f"mcp_config_file={mcp_config_file}")
+    print(f"skip_path_invariant={'true' if skip_path_invariant else 'false'}")
+    print(f"allow_missing_git_remote={'true' if allow_missing_git_remote else 'false'}")
     return 0
 
 
